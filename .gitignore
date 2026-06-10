@@ -1,0 +1,11 @@
+# Backend
+backend/.env
+backend/app.db
+backend/__pycache__/
+backend/connectors/__pycache__/
+backend/venv/
+backend/static/uploads/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
