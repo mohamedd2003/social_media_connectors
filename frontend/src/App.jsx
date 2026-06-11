@@ -73,16 +73,25 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("connected") === "true") {
       setConnected(true);
-      loadAccounts();
+      const platform = params.get("platform");
+      loadAccounts(platform);
       window.history.replaceState({}, "", "/");
     }
   }, []);
 
-  function loadAccounts() {
+  function loadAccounts(selectPlatform) {
     fetch("/api/accounts")
       .then((r) => r.json())
       .then((data) => {
         setAccounts(data);
+        // Auto-select the account matching the platform that just connected
+        if (selectPlatform && data.length > 0) {
+          const match = data.find((a) => a.type === selectPlatform);
+          if (match) {
+            setSelectedAccount(match.id);
+            return;
+          }
+        }
         if (data.length > 0) setSelectedAccount(data[0].id);
       });
   }
@@ -173,6 +182,7 @@ export default function App() {
 
   const currentAccount = accounts.find((a) => a.id === selectedAccount);
   const isInstagram = currentAccount?.type === "instagram";
+  const isSnapchat = currentAccount?.type === "snapchat";
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-8">
@@ -224,8 +234,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Create Post Section */}
-      {!loading && connected && currentAccount && (
+      {/* Create Post Section (FB/IG only) */}
+      {!loading && connected && currentAccount && !isSnapchat && (
         <div className="mb-8 bg-white p-6 border border-gray-200 rounded-lg shadow-sm">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">Create Post</h2>
           <form onSubmit={handlePost}>
@@ -297,7 +307,7 @@ export default function App() {
       {/* Insights Grid */}
       {loading && <p className="text-gray-500 text-sm">Loading insights...</p>}
 
-      {!loading && insights.length > 0 && (
+      {!loading && !isSnapchat && insights.length > 0 && (
         <div className="overflow-x-auto">
           <table className="min-w-full bg-white border border-gray-200 rounded-lg overflow-hidden">
             <thead className="bg-gray-100">
@@ -372,7 +382,7 @@ export default function App() {
         </div>
       )}
 
-      {!loading && connected && insights.length === 0 && selectedAccount && (
+      {!loading && connected && !isSnapchat && insights.length === 0 && selectedAccount && (
         <p className="text-gray-500 text-sm">
           No posts found for this account.
         </p>
@@ -388,19 +398,6 @@ export default function App() {
       {connected && currentAccount?.type === "snapchat" && (
         <div className="mt-8">
           <SnapchatDashboard accountId={selectedAccount} />
-          <div className="mt-4">
-            <h3 className="text-sm font-medium text-gray-700 mb-2">
-              Share to Snapchat Story (Organic)
-            </h3>
-            <SnapchatShareButton
-              mediaUrl=""
-              attachmentUrl={window.location.origin}
-              caption="Check out our latest update!"
-            />
-            <p className="text-xs text-gray-400 mt-1">
-              Opens Snapchat app on mobile to complete the story post.
-            </p>
-          </div>
         </div>
       )}
 

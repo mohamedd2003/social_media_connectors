@@ -1,5 +1,6 @@
 import os
 import glob
+from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
@@ -12,9 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from typing import List, Optional
 
 from database import init_db, save_account, get_accounts, get_account, has_accounts
-from routers.snapchat import router as snapchat_router
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+
+from routers.snapchat import router as snapchat_router
+from routers.snapchat_v1 import router as snapchat_v1_router
 
 APP_ID = os.getenv("META_APP_ID")
 APP_SECRET = os.getenv("META_APP_SECRET")
@@ -58,6 +61,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ─── Snapchat Router ─────────────────────────────────────────────────────
 app.include_router(snapchat_router)
+app.include_router(snapchat_v1_router)
 
 
 # ─── Step 1: OAuth Flow ─────────────────────────────────────────────────────

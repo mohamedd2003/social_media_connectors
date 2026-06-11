@@ -1,0 +1,573 @@
+"""
+Snapchat API Service – Async HTTPX Client
+
+Modular service class for calling both the Public Profile API and the Ads API.
+All HTTP calls are non-blocking via httpx.AsyncClient.
+
+Architecture:
+  SnapchatAPIService  ← stateless, takes access_token per-call
+  ├─ fetch_profile_metrics(profile_id, access_token)
+  │    → GET /v1/public_profiles/{id}
+  │    → GET /v1/public_profiles/{id}/stats
+  │    → GET /v1/public_profiles/{id}/organic/stories
+  │    → GET /v1/public_profiles/{id}/organic/spotlights
+  │
+  └─ fetch_ads_reporting(ad_account_id, access_token, start_date, end_date)
+       → GET /v1/adaccounts/{id}
+       → GET /v1/adaccounts/{id}/campaigns
+       → For each campaign:
+           → GET /v1/campaigns/{id}/stats?granularity=DAY
+           → GET /v1/campaigns/{id}/adsquads
+           → For each ad_squad:
+               → GET /v1/adsquads/{id}/stats?granularity=TOTAL
+
+DNS workaround: reuses the existing _ensure_dns / _api / _make_headers
+helpers from connectors.snapchat so IP-fallback works transparently.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+import httpx
+from fastapi import HTTPException
+
+from connectors.snapchat import (
+    _ensure_dns,
+    _api,
+    _profile_api,
+    _make_headers,
+    _make_profile_headers,
+    _snap_verify,
+    _snap_profile_verify,
+)
+from schemas.snapchat_v2 import (
+    AdEntityStats,
+    AdsReportingResponse,
+    CampaignReportDetail,
+    DailyReportingRow,
+    OrganicStoryStats,
+    ProfileInfo,
+    ProfileInsightsResponse,
+    ProfileMetrics,
+    SpotlightMetadata,
+    SpotlightStats,
+    StoryMetadata,
+)
+
+logger = logging.getLogger("snapchat.api_service")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Error classification helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _raise_for_status(resp: httpx.Response, context: str) -> None:
+    """
+    Translate common Snapchat API errors into clear FastAPI HTTPExceptions.
+
+    Handles:
+      401 → Expired/invalid token
+      403 → Missing scope (e.g., snapchat-profiles-api not enabled)
+      429 → Rate limited
+      404 → Resource not found
+      5xx → Snapchat server error
+    """
+    if resp.status_code == 200:
+        return
+
+    status = resp.status_code
+    body = resp.text[:500]
+
+    if status == 401:
+        raise HTTPException(
+            401,
+            f"Snapchat token expired or invalid ({context}). "
+            "Re-authenticate via /snap/auth/login or call /snap/auth/refresh.",
+        )
+    if status == 403:
+        raise HTTPException(
+            403,
+            f"Forbidden: missing required scope for {context}. "
+            "The Public Profile API is allowlist-only. "
+            "Email marketingapi-support@snap.com with your client_id to request access.",
+        )
+    if status == 429:
+        retry_after = resp.headers.get("Retry-After", "60")
+        raise HTTPException(
+            429,
+            f"Rate limited by Snapchat ({context}). "
+            f"Retry after {retry_after} seconds.",
+        )
+    if status == 404:
+        raise HTTPException(
+            404,
+            f"Resource not found ({context}). "
+            f"Response: {body}",
+        )
+    if status >= 500:
+        raise HTTPException(
+            502,
+            f"Snapchat server error {status} ({context}). "
+            f"Response: {body}",
+        )
+
+    raise HTTPException(
+        status,
+        f"Snapchat API error {status} ({context}): {body}",
+    )
+
+
+def _handle_network_error(e: Exception, context: str) -> None:
+    """Translate DNS / connection errors to 502."""
+    msg = str(e)
+    if "getaddrinfo" in msg or "ConnectError" in msg or "NameResolutionError" in msg:
+        raise HTTPException(
+            502,
+            f"DNS lookup failed for adsapi.snapchat.com ({context}). "
+            "Disable DNS/ad-block filtering or switch to 8.8.8.8 / 1.1.1.1.",
+        )
+    raise HTTPException(500, f"Network error ({context}): {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SnapchatAPIService
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SnapchatAPIService:
+    """
+    Stateless async service for Snapchat Marketing & Public Profile APIs.
+
+    Each method accepts an access_token and returns a typed Pydantic model.
+    Token management (refresh, storage) is handled upstream by
+    services.snapchat_service.ensure_fresh_token().
+    """
+
+    # ── Public Profile API ────────────────────────────────────────────────
+
+    async def fetch_profile_metrics(
+        self,
+        profile_id: str,
+        access_token: str,
+    ) -> ProfileInsightsResponse:
+        """
+        Fetch organic insights for a Public Profile.
+
+        Uses businessapi.snapchat.com (NOT adsapi.snapchat.com):
+          1. GET /public/v1/public_profiles/{profile_id}         → profile metadata (public)
+          2. GET /public/v1/public_profiles/{profile_id}/stats   → aggregate metrics (public)
+          3. GET /v1/public_profiles/{profile_id}/organic/stories    → story list (authorized)
+          4. GET /v1/public_profiles/{profile_id}/organic/spotlights → spotlights (authorized)
+
+        Returns a ProfileInsightsResponse with all data merged.
+        """
+        await _ensure_dns()
+        profile_headers = _make_profile_headers(access_token)
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0, verify=_snap_profile_verify) as client:
+                # ── 1. Profile metadata (public endpoint) ────────────────
+                profile_resp = await client.get(
+                    _profile_api(f"/public/v1/public_profiles/{profile_id}"),
+                    headers=profile_headers,
+                )
+
+                profile_info = ProfileInfo(id=profile_id)
+                if profile_resp.status_code == 200:
+                    raw = profile_resp.json()
+                    pp = raw.get("public_profile", raw.get("public_profiles", [{}]))
+                    if isinstance(pp, list):
+                        pp = pp[0].get("public_profile", pp[0]) if pp else {}
+                    profile_info = ProfileInfo(
+                        id=pp.get("id", profile_id),
+                        name=pp.get("display_name", pp.get("name", "")),
+                        snap_user_name=pp.get("snap_user_name"),
+                        profile_picture_url=(pp.get("logo_urls") or {}).get("original_logo_url"),
+                        bio=pp.get("bio"),
+                        tier=pp.get("profile_tier"),
+                        category=pp.get("internal_profile_category"),
+                        subscriber_count=int(pp.get("subscriber_count", 0) or 0),
+                        organization_id=pp.get("organization_id"),
+                        website_url=pp.get("website_url"),
+                        logo_urls=pp.get("logo_urls"),
+                    )
+                elif profile_resp.status_code in (401, 403, 429):
+                    _raise_for_status(profile_resp, "fetch profile metadata")
+
+                # ── 2. Profile stats (public endpoint) ───────────────────
+                now = datetime.now(timezone.utc)
+                end_time = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                start_time = (now - timedelta(days=28)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+                stats_resp = await client.get(
+                    _profile_api(f"/public/v1/public_profiles/{profile_id}/stats"),
+                    headers=profile_headers,
+                    params={"start_time": start_time, "end_time": end_time},
+                )
+
+                metrics = ProfileMetrics(profile_id=profile_id)
+                if stats_resp.status_code == 200:
+                    raw_stats = stats_resp.json()
+                    ps = raw_stats.get("profile_stats", raw_stats)
+                    if isinstance(ps, list) and ps:
+                        ps = ps[0]
+
+                    metrics = ProfileMetrics(
+                        profile_id=profile_id,
+                        subscriber_count=int(ps.get("subscriber_count", 0) or ps.get("followers", 0) or 0),
+                        subscriber_change=ps.get("subscriber_change", 0),
+                        total_story_views=ps.get("total_story_views", 0) or ps.get("story_views", 0),
+                        unique_story_viewers=ps.get("unique_story_viewers", 0),
+                        total_shares=ps.get("total_shares", 0) or ps.get("shares", 0),
+                        total_screenshots=ps.get("total_screenshots", 0) or ps.get("screenshots", 0),
+                        total_reach=ps.get("total_reach", 0) or ps.get("reach", 0),
+                        total_time_viewed_ms=ps.get("total_time_viewed_ms", 0),
+                        avg_completion_rate=ps.get("avg_completion_rate"),
+                    )
+                elif stats_resp.status_code in (401, 403, 429):
+                    _raise_for_status(stats_resp, "fetch profile stats")
+
+                # ── 3. Stories (authorized endpoint) ─────────────────────
+                stories_resp = await client.get(
+                    _profile_api(f"/v1/public_profiles/{profile_id}/organic/stories"),
+                    headers=profile_headers,
+                )
+
+                stories: list[StoryMetadata] = []
+                if stories_resp.status_code == 200:
+                    for s in stories_resp.json().get("stories", []):
+                        story = s.get("story", s)
+                        stories.append(StoryMetadata(
+                            id=story.get("id", ""),
+                            name=story.get("name"),
+                            status=story.get("status"),
+                            snap_count=story.get("snap_count", 0),
+                            created_at=story.get("created_at"),
+                            expires_at=story.get("expires_at"),
+                            media_url=story.get("media_url"),
+                            thumbnail_url=story.get("thumbnail_url"),
+                        ))
+
+                # ── 4. Spotlights (authorized endpoint) ──────────────────
+                spot_resp = await client.get(
+                    _profile_api(f"/v1/public_profiles/{profile_id}/organic/spotlights"),
+                    headers=profile_headers,
+                )
+
+                spotlights: list[SpotlightMetadata] = []
+                if spot_resp.status_code == 200:
+                    raw_spots = spot_resp.json()
+                    for s in raw_spots.get("spotlights", raw_spots.get("spotlight", [])):
+                        item = s.get("spotlight", s)
+                        spotlights.append(SpotlightMetadata(
+                            id=item.get("id", ""),
+                            name=item.get("name"),
+                            status=item.get("status"),
+                            created_at=item.get("created_at"),
+                            media_url=item.get("media_url"),
+                            thumbnail_url=item.get("thumbnail_url"),
+                            duration_ms=item.get("duration_ms"),
+                        ))
+
+                api_ok = (
+                    profile_resp.status_code == 200
+                    or stats_resp.status_code == 200
+                )
+                error_msg = None
+                if not api_ok:
+                    error_msg = (
+                        "Public Profile API returned non-200. "
+                        "This API is allowlist-only. Email your Snap contact with "
+                        f"client_id to request access. Status: {profile_resp.status_code}"
+                    )
+
+                return ProfileInsightsResponse(
+                    profile=profile_info,
+                    metrics=metrics,
+                    stories=stories,
+                    spotlight=spotlights,
+                    api_available=api_ok,
+                    error=error_msg,
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            _handle_network_error(e, "fetch_profile_metrics")
+            raise  # unreachable, _handle_network_error always raises
+
+    async def fetch_story_stats(
+        self,
+        profile_id: str,
+        story_id: str,
+        access_token: str,
+    ) -> OrganicStoryStats:
+        """
+        Fetch per-story organic metrics.
+          GET businessapi.snapchat.com/v1/public_profiles/{profile_id}/organic/stories/{story_id}/stats
+        """
+        await _ensure_dns()
+        headers = _make_profile_headers(access_token)
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=_snap_profile_verify) as client:
+                resp = await client.get(
+                    _profile_api(f"/v1/public_profiles/{profile_id}/organic/stories/{story_id}/stats"),
+                    headers=headers,
+                )
+                _raise_for_status(resp, f"story stats for {story_id}")
+
+                raw = resp.json()
+                ss = raw.get("story_stats", raw)
+                return OrganicStoryStats(
+                    story_id=story_id,
+                    total_views=ss.get("total_views", 0),
+                    unique_viewers=ss.get("unique_viewers", 0),
+                    screenshots=ss.get("screenshots", 0),
+                    shares=ss.get("shares", 0),
+                    total_time_viewed_ms=ss.get("total_time_viewed_ms", 0),
+                    completion_rate=ss.get("completion_rate"),
+                    subscribers_gained=ss.get("subscribers_gained", 0),
+                    subscribers_lost=ss.get("subscribers_lost", 0),
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            _handle_network_error(e, "fetch_story_stats")
+            raise
+
+    # ── Ads API – Campaign Reporting ─────────────────────────────────────
+
+    async def fetch_ads_reporting(
+        self,
+        ad_account_id: str,
+        access_token: str,
+        start_date: str,
+        end_date: str,
+    ) -> AdsReportingResponse:
+        """
+        Fetch campaign-level ad performance for the given date range.
+
+        Walks:
+          1. GET /v1/adaccounts/{id}               → account metadata
+          2. GET /v1/adaccounts/{id}/campaigns      → campaign list
+          3. For each campaign:
+             GET /v1/campaigns/{id}/stats?granularity=DAY&start_time=...&end_time=...
+          4. (Optional) GET /v1/campaigns/{id}/adsquads → ad squad details
+             GET /v1/adsquads/{id}/stats?granularity=TOTAL
+
+        Returns AdsReportingResponse with roll-up totals + per-campaign details.
+        """
+        await _ensure_dns()
+        headers = _make_headers(access_token)
+
+        # Normalize date strings to Snapchat's expected ISO format
+        start_time = f"{start_date}T00:00:00.000Z"
+        end_time = f"{end_date}T23:59:59.000Z"
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0, verify=_snap_verify) as client:
+
+                # ── 1. Ad Account metadata ───────────────────────────────
+                acct_resp = await client.get(
+                    _api(f"/adaccounts/{ad_account_id}"),
+                    headers=headers,
+                )
+                _raise_for_status(acct_resp, "fetch ad account")
+
+                acct_data = acct_resp.json().get("adaccounts", [{}])
+                acct = acct_data[0].get("adaccount", acct_data[0]) if acct_data else {}
+                acct_name = acct.get("name", "")
+                currency = acct.get("currency", "USD")
+
+                # ── 2. Campaign list ─────────────────────────────────────
+                camp_resp = await client.get(
+                    _api(f"/adaccounts/{ad_account_id}/campaigns"),
+                    headers=headers,
+                )
+                _raise_for_status(camp_resp, "fetch campaigns")
+
+                campaigns_raw = camp_resp.json().get("campaigns", [])
+
+                campaign_reports: list[CampaignReportDetail] = []
+                grand_impressions = 0
+                grand_spend_micro = 0
+                grand_swipes = 0
+                grand_conversions = 0
+
+                for camp_wrapper in campaigns_raw:
+                    camp = camp_wrapper.get("campaign", camp_wrapper)
+                    camp_id = camp.get("id")
+                    if not camp_id:
+                        continue
+
+                    camp_name = camp.get("name", "")
+                    camp_status = camp.get("status")
+                    camp_objective = camp.get("objective")
+
+                    # ── 3. Campaign-level stats (daily) ──────────────────
+                    stats_resp = await client.get(
+                        _api(f"/campaigns/{camp_id}/stats"),
+                        headers=headers,
+                        params={
+                            "granularity": "DAY",
+                            "start_time": start_time,
+                            "end_time": end_time,
+                            "fields": (
+                                "impressions,swipes,spend,video_views,"
+                                "video_views_15s,screen_time_millis,"
+                                "quartile_1,quartile_2,quartile_3,view_completion,"
+                                "saves,shares,story_opens,"
+                                "conversion_purchases,conversion_purchases_value"
+                            ),
+                        },
+                    )
+
+                    # Build totals + daily breakdown
+                    camp_impressions = 0
+                    camp_swipes = 0
+                    camp_spend_micro = 0
+                    camp_video_views = 0
+                    camp_conversions = 0
+                    daily_rows: list[DailyReportingRow] = []
+
+                    if stats_resp.status_code == 200:
+                        ts_list = stats_resp.json().get("timeseries_stats", [])
+                        for ts_wrapper in ts_list:
+                            ts = ts_wrapper.get("timeseries_stat", ts_wrapper)
+                            timeseries = ts.get("timeseries", [])
+                            for point in timeseries:
+                                day_stats = point.get("stats", {})
+                                day_impressions = day_stats.get("impressions", 0)
+                                day_swipes = day_stats.get("swipes", 0)
+                                day_spend = day_stats.get("spend", 0)
+                                day_vv = day_stats.get("video_views", 0)
+                                day_conv = day_stats.get("conversion_purchases", 0)
+
+                                camp_impressions += day_impressions
+                                camp_swipes += day_swipes
+                                camp_spend_micro += day_spend
+                                camp_video_views += day_vv
+                                camp_conversions += day_conv
+
+                                # Extract date from start_time
+                                day_date = point.get("start_time", "")[:10]
+                                if day_date:
+                                    daily_rows.append(DailyReportingRow(
+                                        date=day_date,
+                                        impressions=day_impressions,
+                                        swipes=day_swipes,
+                                        spend_micro=day_spend,
+                                        spend=day_spend / 1_000_000,
+                                        video_views=day_vv,
+                                        conversion_purchases=day_conv,
+                                    ))
+
+                    swipe_rate = (
+                        round((camp_swipes / camp_impressions) * 100, 4)
+                        if camp_impressions > 0 else None
+                    )
+
+                    camp_totals = AdEntityStats(
+                        entity_id=camp_id,
+                        entity_name=camp_name,
+                        entity_type="campaign",
+                        status=camp_status,
+                        impressions=camp_impressions,
+                        swipes=camp_swipes,
+                        spend_micro=camp_spend_micro,
+                        spend=camp_spend_micro / 1_000_000,
+                        video_views=camp_video_views,
+                        conversion_purchases=camp_conversions,
+                        swipe_up_pct=swipe_rate,
+                    )
+
+                    # ── 4. Ad Squad-level stats (optional) ───────────────
+                    squad_stats: list[AdEntityStats] = []
+                    sq_resp = await client.get(
+                        _api(f"/campaigns/{camp_id}/adsquads"),
+                        headers=headers,
+                    )
+                    if sq_resp.status_code == 200:
+                        for sq_wrapper in sq_resp.json().get("adsquads", []):
+                            sq = sq_wrapper.get("adsquad", sq_wrapper)
+                            sq_id = sq.get("id")
+                            if not sq_id:
+                                continue
+
+                            sq_stats_resp = await client.get(
+                                _api(f"/adsquads/{sq_id}/stats"),
+                                headers=headers,
+                                params={
+                                    "granularity": "TOTAL",
+                                    "start_time": start_time,
+                                    "end_time": end_time,
+                                    "fields": "impressions,swipes,spend,video_views,conversion_purchases",
+                                },
+                            )
+                            sq_imps = sq_swipes = sq_spend = sq_conv = 0
+                            if sq_stats_resp.status_code == 200:
+                                sq_ts = sq_stats_resp.json().get("timeseries_stats", [])
+                                if sq_ts:
+                                    sq_totals = (
+                                        sq_ts[0]
+                                        .get("timeseries_stat", {})
+                                        .get("timeseries", [{}])[0]
+                                        .get("stats", {})
+                                    )
+                                    sq_imps = sq_totals.get("impressions", 0)
+                                    sq_swipes = sq_totals.get("swipes", 0)
+                                    sq_spend = sq_totals.get("spend", 0)
+                                    sq_conv = sq_totals.get("conversion_purchases", 0)
+
+                            squad_stats.append(AdEntityStats(
+                                entity_id=sq_id,
+                                entity_name=sq.get("name", ""),
+                                entity_type="adsquad",
+                                status=sq.get("status"),
+                                impressions=sq_imps,
+                                swipes=sq_swipes,
+                                spend_micro=sq_spend,
+                                spend=sq_spend / 1_000_000,
+                                conversion_purchases=sq_conv,
+                            ))
+
+                    campaign_reports.append(CampaignReportDetail(
+                        campaign_id=camp_id,
+                        campaign_name=camp_name,
+                        status=camp_status,
+                        objective=camp_objective,
+                        daily_budget_micro=camp.get("daily_budget_micro"),
+                        start_time=camp.get("start_time"),
+                        end_time=camp.get("end_time"),
+                        totals=camp_totals,
+                        daily_breakdown=daily_rows,
+                        ad_squads=squad_stats,
+                    ))
+
+                    grand_impressions += camp_impressions
+                    grand_spend_micro += camp_spend_micro
+                    grand_swipes += camp_swipes
+                    grand_conversions += camp_conversions
+
+                return AdsReportingResponse(
+                    ad_account_id=ad_account_id,
+                    ad_account_name=acct_name,
+                    currency=currency,
+                    start_date=start_date,
+                    end_date=end_date,
+                    total_impressions=grand_impressions,
+                    total_spend=grand_spend_micro / 1_000_000,
+                    total_swipes=grand_swipes,
+                    total_conversions=grand_conversions,
+                    campaigns=campaign_reports,
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            _handle_network_error(e, "fetch_ads_reporting")
+            raise  # unreachable
