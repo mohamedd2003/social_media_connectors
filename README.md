@@ -175,3 +175,13 @@ Tables:
 - Do not commit .env with real secrets.
 - This project is a prototype and not hardened for public production use.
 - Protect callback URLs, token storage, and CORS settings before deployment.
+
+
+
+
+
+
+## Run  Tunnel Write it
+
+
+npx localtunnel --port 8000 --subdomain miraf-meta
