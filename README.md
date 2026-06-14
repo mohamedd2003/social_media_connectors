@@ -1,64 +1,77 @@
-# Meta Insights Dashboard – Prototype
+# Meta + Snapchat Insights Dashboard
 
-A minimal prototype that connects to Meta's Graph API (v22.0) to retrieve and display post insights for Facebook Pages and Instagram Business accounts.
+FastAPI + React dashboard for connected social accounts, including:
+
+- Facebook Pages (Meta Graph API)
+- Instagram Business Accounts (Meta Graph API)
+- Snapchat Ad Accounts / Public Profile data (Snapchat APIs)
+
+The app supports OAuth connection, account storage in SQLite, insights retrieval, and Snapchat-specific dashboard views.
 
 ## Project Structure
 
-```
+```text
 meta/
 ├── backend/
-│   ├── main.py            # FastAPI app (OAuth + insights endpoints)
-│   ├── database.py        # SQLite helper
-│   ├── requirements.txt
-│   └── .env.example       # Template for credentials
+│   ├── main.py
+│   ├── database.py
+│   ├── connectors/
+│   │   ├── facebook.py
+│   │   ├── instagram.py
+│   │   └── snapchat.py
+│   ├── routers/
+│   │   ├── snapchat.py
+│   │   └── snapchat_v1.py
+│   ├── services/
+│   │   ├── snapchat_service.py
+│   │   └── snapchat_api_service.py
+│   └── requirements.txt
 └── frontend/
     ├── src/
-    │   ├── App.jsx        # Single-page dashboard
-    │   ├── main.jsx
-    │   └── index.css
-    ├── index.html
-    ├── package.json
-    ├── vite.config.js
-    ├── tailwind.config.js
-    └── postcss.config.js
+    │   ├── App.jsx
+    │   └── components/
+    │       ├── SnapchatOAuthButton.jsx
+    │       ├── SnapchatDashboard.jsx
+    │       └── SnapchatShareButton.jsx
+    └── package.json
 ```
-
----
 
 ## Prerequisites
 
 - Python 3.10+
 - Node.js 18+
-- A **Meta Developer App** with:
-  - Facebook Login product added
-  - Valid OAuth redirect URI set to `http://localhost:8000/auth/callback`
-  - Permissions configured: `pages_show_list`, `pages_read_engagement`, `read_insights`, `instagram_basic`, `instagram_manage_insights`
+- Meta developer app (for Facebook/Instagram)
+- Snapchat app credentials (for OAuth + ads/profile endpoints)
 
----
+## Environment Variables
 
-## Setup Instructions
-
-### 1. Configure Credentials
-
-```bash
-cd backend
-copy .env.example .env
-```
-
-Open `backend/.env` and paste your credentials:
+Create backend/.env and configure at least:
 
 ```env
-META_APP_ID=123456789012345
-META_APP_SECRET=abcdef1234567890abcdef1234567890
-REDIRECT_URI=http://localhost:8000/auth/callback
+# Common
+PUBLIC_BACKEND_URL=http://localhost:8000
 FRONTEND_URL=http://localhost:5173
+
+# Meta
+META_APP_ID=...
+META_APP_SECRET=...
+REDIRECT_URI=http://localhost:8000/auth/callback
+
+# Snapchat
+SNAP_CLIENT_ID=...
+SNAP_CLIENT_SECRET=...
+SNAP_REDIRECT_URI=http://localhost:8000/snap/auth/callback
+SNAP_OAUTH_SCOPE=snapchat-marketing-api snapchat-profile-api
 ```
 
-> Get these from https://developers.facebook.com → Your App → Settings → Basic.
+Notes:
+- Snapchat token endpoints use HTTP Basic auth with SNAP_CLIENT_ID:SNAP_CLIENT_SECRET.
+- Access token refresh is handled automatically before API calls when refresh_token exists.
+- Snapchat access tokens are short-lived (around 30 minutes), so refresh flow is required.
 
----
+## Run Locally
 
-### 2. Start the Backend
+Backend:
 
 ```bash
 cd backend
@@ -66,11 +79,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-The API will be available at `http://localhost:8000`.
-
----
-
-### 3. Start the Frontend
+Frontend:
 
 ```bash
 cd frontend
@@ -78,44 +87,91 @@ npm install
 npm run dev
 ```
 
-The dashboard will be at `http://localhost:5173`.
+App URLs:
+- Frontend: http://localhost:5173
+- Backend: http://localhost:8000
 
----
+## Snapchat Integration Overview
 
-## How to Use
+### OAuth Flow
 
-1. Open `http://localhost:5173` in your browser.
-2. Click **"Connect Facebook / Instagram"** – you'll be redirected to Meta's login screen.
-3. Authorize the app and grant the requested permissions.
-4. After redirect, you'll see a green **"Connected"** badge.
-5. Select a Page or Instagram account from the dropdown.
-6. Post insights will load in the table with calculated engagement rates.
+1. Frontend button calls /snap/auth/login.
+2. User authorizes on Snapchat.
+3. Snapchat redirects to /snap/auth/callback.
+4. Backend exchanges code for access_token + refresh_token.
+5. Account is stored in SQLite accounts table with type=snapchat.
 
----
+Primary router prefix for Snapchat routes: /snap
 
-## Engagement Rate Formula
+### Main Snapchat Endpoints
 
-$$
-\text{Engagement Rate} = \frac{\text{Likes} + \text{Comments} + \text{Saves}}{\text{Reach}} \times 100
-$$
+OAuth and account setup:
+- GET /snap/auth/login
+- GET /snap/auth/callback
+- POST /snap/discover
+- POST /snap/auth/refresh
 
-If Reach is unavailable, Impressions is used as the denominator.
+Insights and profile dashboard:
+- GET /snap/profile/overview
+- GET /snap/insights
+- GET /snap/profile/insights
+- GET /snap/profile/stories
+- GET /snap/profile/spotlight
+- GET /snap/profile/promotions
 
----
+Manual metrics fallback:
+- GET /snap/manual-metrics
+- PUT /snap/manual-metrics
 
-## Alerts
+Stories/media:
+- GET /snap/stories
+- POST /snap/stories/create
+- POST /snap/profile/stories/create
+- DELETE /snap/media/{media_id}
 
-| Badge                  | Condition            |
-| ---------------------- | -------------------- |
-| 🔴 **Needs attention** | Engagement Rate < 1% |
-| 🟢 **High Engagement** | Engagement Rate > 5% |
+Campaign/ad creation:
+- POST /snap/campaigns/create
+- POST /snap/ads/create
 
----
+### Versioned Snapchat Analytics API
 
-## Notes
+Additional production-style endpoints are available under:
 
-- Tokens are stored in a local `app.db` SQLite file (created automatically).
-- Long-lived user tokens expire after 60 days. Re-connect to refresh.
-- This is a prototype – not production-ready. Do not expose to the public internet without adding proper security.
+- GET /api/v1/snapchat/profile-insights/{profile_id}
+- GET /api/v1/snapchat/profile-insights/{profile_id}/stories/{story_id}/stats
+- GET /api/v1/snapchat/ads-insights/{ad_account_id}
 
-npx localtunnel --port 8000 --subdomain miraf-meta
+These endpoints are implemented via services/snapchat_api_service.py and include structured error handling for 401/403/404/429/5xx cases.
+
+### DNS / Network Troubleshooting
+
+If Snapchat requests fail with DNS-related errors (getaddrinfo/NameResolutionError/ConnectError), the backend returns clear 502 messages.
+
+Typical fixes:
+- Disable DNS/ad-block filtering tools.
+- Switch DNS resolver to 8.8.8.8 or 1.1.1.1.
+- Retry /snap/discover after connectivity is fixed.
+
+## Frontend Snapchat Behavior
+
+- Snapchat connection button: + Add Snapchat
+- If selected account type is snapchat, UI renders SnapchatDashboard instead of the FB/IG post composer.
+- Dashboard supports:
+  - Profile header and overview metrics
+  - Public stories / saved stories / spotlight tabs
+  - Optional ads campaign insight section
+  - Manual metric editing and persistence
+
+## Data Storage
+
+SQLite database file: backend/app.db
+
+Tables:
+- accounts: stores tokens and account metadata (including refresh_token and org_id)
+- manual_metrics: Snapchat fallback metrics (followers, reach, views)
+
+## Security Notes
+
+- Do not commit .env with real secrets.
+- This project is a prototype and not hardened for public production use.
+- Protect callback URLs, token storage, and CORS settings before deployment.
