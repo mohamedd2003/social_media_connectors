@@ -24,6 +24,14 @@ def init_db():
             refresh_token TEXT,
             org_id TEXT
         );
+        CREATE TABLE IF NOT EXISTS manual_metrics (
+            account_id TEXT PRIMARY KEY,
+            followers INTEGER DEFAULT 0,
+            reach INTEGER DEFAULT 0,
+            views INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (account_id) REFERENCES accounts(id)
+        );
     """)
     # Migrate: add columns if upgrading from older schema
     cursor = conn.execute("PRAGMA table_info(accounts)")
@@ -83,3 +91,33 @@ def has_accounts():
     row = conn.execute("SELECT COUNT(*) as cnt FROM accounts").fetchone()
     conn.close()
     return row["cnt"] > 0
+
+
+def get_manual_metrics(account_id: str) -> dict:
+    """Get manual metrics for a Snapchat account."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT followers, reach, views, updated_at FROM manual_metrics WHERE account_id = ?",
+        (account_id,),
+    ).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {"followers": 0, "reach": 0, "views": 0, "updated_at": None}
+
+
+def save_manual_metrics(account_id: str, followers: int = 0, reach: int = 0, views: int = 0):
+    """Upsert manual metrics for a Snapchat account."""
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO manual_metrics (account_id, followers, reach, views, updated_at)
+           VALUES (?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(account_id) DO UPDATE SET
+             followers = excluded.followers,
+             reach = excluded.reach,
+             views = excluded.views,
+             updated_at = datetime('now')""",
+        (account_id, followers, reach, views),
+    )
+    conn.commit()
+    conn.close()

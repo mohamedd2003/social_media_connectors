@@ -1025,11 +1025,21 @@ class SnapchatConnector(BaseConnector):
                 "by clicking the Re-authenticate button above."
             )
         elif not public_stories and not spotlight_items:
-            # Profile metadata works but organic content endpoints use gRPC (not yet supported)
             error_msg = (
                 "Profile connected. Organic stories/stats endpoints use gRPC — "
                 "metrics may need manual entry. Use Edit Manual Metrics to enter values from profile.snapchat.com."
             )
+
+        # Merge manual metrics from DB when API returns zeros
+        from database import get_manual_metrics
+        manual = get_manual_metrics(ad_account_id)
+        if manual:
+            if not metrics["total_followers"]["current"] and manual.get("followers"):
+                metrics["total_followers"]["current"] = manual["followers"]
+            if not metrics["total_reach"]["current"] and manual.get("reach"):
+                metrics["total_reach"]["current"] = manual["reach"]
+            if not metrics["profile_views"]["current"] and manual.get("views"):
+                metrics["profile_views"]["current"] = manual["views"]
 
         return {
             "profile": profile,

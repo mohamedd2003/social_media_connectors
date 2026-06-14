@@ -23,7 +23,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import RedirectResponse
 
 from connectors.snapchat import SnapchatConnector
-from database import get_account, save_account, update_account_tokens
+from database import get_account, get_manual_metrics, save_account, save_manual_metrics, update_account_tokens
 from schemas.snapchat import (
     SnapAdCreate,
     SnapAdSquadCreate,
@@ -357,6 +357,31 @@ async def profile_overview(account_id: str = Query(...)):
         raise
     except Exception as e:
         _handle_dns_error(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Manual Metrics (backend-persisted fallback for gRPC-blocked stats)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/manual-metrics")
+async def get_metrics(account_id: str = Query(...)):
+    """Get stored manual metrics for a Snapchat account."""
+    _get_snap_account(account_id)  # validate account exists
+    return get_manual_metrics(account_id)
+
+
+@router.put("/manual-metrics")
+async def put_metrics(
+    account_id: str = Query(...),
+    followers: int = Query(default=0, ge=0),
+    reach: int = Query(default=0, ge=0),
+    views: int = Query(default=0, ge=0),
+):
+    """Save manual metrics for a Snapchat account (persisted in DB)."""
+    _get_snap_account(account_id)  # validate account exists
+    save_manual_metrics(account_id, followers, reach, views)
+    return get_manual_metrics(account_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -26,6 +26,7 @@ export default function SnapchatDashboard({ accountId, backendUrl = "" }) {
     reach: "",
     views: "",
   });
+  const [hasManualMetrics, setHasManualMetrics] = useState(false);
   const [editingMetrics, setEditingMetrics] = useState(false);
   const [deleting, setDeleting] = useState(null); // media_id being deleted
 
@@ -73,32 +74,68 @@ export default function SnapchatDashboard({ accountId, backendUrl = "" }) {
     fetchAdsInsights();
   }, [fetchOverview, fetchAdsInsights]);
 
-  // Load manual metrics from localStorage
+  // Load manual metrics from backend DB
   useEffect(() => {
     if (!accountId) return;
-    try {
-      const raw = localStorage.getItem(`snap_manual_metrics_${accountId}`);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setManualMetrics({
-          followers: parsed?.followers ?? "",
-          reach: parsed?.reach ?? "",
-          views: parsed?.views ?? "",
-        });
+    (async () => {
+      try {
+        const res = await fetch(
+          `${backendUrl}/snap/manual-metrics?account_id=${accountId}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          setManualMetrics({
+            followers: data.followers || "",
+            reach: data.reach || "",
+            views: data.views || "",
+          });
+          setHasManualMetrics(Boolean(data.updated_at));
+        }
+      } catch {
+        // Fallback: load from localStorage (migration)
+        try {
+          const raw = localStorage.getItem(`snap_manual_metrics_${accountId}`);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            setManualMetrics({
+              followers: parsed?.followers ?? "",
+              reach: parsed?.reach ?? "",
+              views: parsed?.views ?? "",
+            });
+            setHasManualMetrics(true);
+          }
+        } catch {
+          /* ignore */
+        }
       }
-    } catch {
-      /* ignore */
-    }
-  }, [accountId]);
+    })();
+  }, [accountId, backendUrl]);
 
-  // Save manual metrics to localStorage
-  useEffect(() => {
+  // Save manual metrics to backend DB (and localStorage as fallback)
+  const saveManualMetrics = useCallback(async () => {
     if (!accountId) return;
+    const f = Number(manualMetrics.followers) || 0;
+    const r = Number(manualMetrics.reach) || 0;
+    const v = Number(manualMetrics.views) || 0;
+    // Save to localStorage as fallback
     localStorage.setItem(
       `snap_manual_metrics_${accountId}`,
       JSON.stringify(manualMetrics)
     );
-  }, [manualMetrics, accountId]);
+    // Save to backend DB
+    try {
+      await fetch(
+        `${backendUrl}/snap/manual-metrics?account_id=${accountId}&followers=${f}&reach=${r}&views=${v}`,
+        { method: "PUT" }
+      );
+    } catch {
+      /* localStorage fallback already saved */
+    }
+    setHasManualMetrics(true);
+    setEditingMetrics(false);
+    // Refresh overview to merge new manual metrics
+    fetchOverview();
+  }, [accountId, backendUrl, manualMetrics, fetchOverview]);
 
   async function handleDeleteMedia(mediaId) {
     if (!confirm("Delete this media? This cannot be undone.")) return;
@@ -147,13 +184,16 @@ export default function SnapchatDashboard({ accountId, backendUrl = "" }) {
   const savedStories = overview?.saved_stories || [];
   const spotlight = overview?.spotlight || [];
 
-  // Use API metrics if available, otherwise use manual localStorage values
-  const displayFollowers =
-    metrics.total_followers?.current || Number(manualMetrics.followers) || 0;
-  const displayReach =
-    metrics.total_reach?.current || Number(manualMetrics.reach) || 0;
-  const displayViews =
-    metrics.profile_views?.current || Number(manualMetrics.views) || 0;
+  // When manual metrics exist, prioritize them for display.
+  const displayFollowers = hasManualMetrics
+    ? Number(manualMetrics.followers) || 0
+    : metrics.total_followers?.current || 0;
+  const displayReach = hasManualMetrics
+    ? Number(manualMetrics.reach) || 0
+    : metrics.total_reach?.current || 0;
+  const displayViews = hasManualMetrics
+    ? Number(manualMetrics.views) || 0
+    : metrics.profile_views?.current || 0;
 
   const followersPct = metrics.total_followers?.change_pct;
   const reachPct = metrics.total_reach?.change_pct;
@@ -310,13 +350,35 @@ export default function SnapchatDashboard({ accountId, backendUrl = "" }) {
           {/* ═══ Overview Metrics (Followers / Reach / Views) ══════════ */}
           <div className="bg-white border border-gray-200 rounded-xl shadow-sm p-6">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-base font-semibold text-gray-900">Overview</h3>
-              {(!overview.api_available || (displayFollowers === 0 && displayReach === 0 && displayViews === 0)) && (
+              <div className="flex items-center gap-2">
+                <h3 className="text-base font-semibold text-gray-900">Overview</h3>
+                {hasManualMetrics && !editingMetrics && (
+                  <span className="text-[11px] px-2 py-0.5 rounded-full border border-blue-200 text-blue-700 bg-blue-50">
+                    Manual values
+                  </span>
+                )}
+              </div>
+              {editingMetrics ? (
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setEditingMetrics(false)}
+                    className="text-xs text-gray-500 hover:text-gray-700 underline"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={saveManualMetrics}
+                    className="text-xs text-blue-600 hover:text-blue-800 underline"
+                  >
+                    Save Metrics
+                  </button>
+                </div>
+              ) : (
                 <button
-                  onClick={() => setEditingMetrics(!editingMetrics)}
+                  onClick={() => setEditingMetrics(true)}
                   className="text-xs text-blue-600 hover:text-blue-800 underline"
                 >
-                  {editingMetrics ? "Done" : "Edit Manual Metrics"}
+                  Edit Manual Metrics
                 </button>
               )}
             </div>
