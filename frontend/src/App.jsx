@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import SnapchatOAuthButton from "./components/SnapchatOAuthButton";
 import SnapchatDashboard from "./components/SnapchatDashboard";
 import SnapchatShareButton from "./components/SnapchatShareButton";
+import TikTokDashboard from "./components/TikTokDashboard";
 
 function engagementBadge(rate) {
   if (rate === null || rate === undefined) return null;
@@ -183,6 +184,7 @@ export default function App() {
   const currentAccount = accounts.find((a) => a.id === selectedAccount);
   const isInstagram = currentAccount?.type === "instagram";
   const isSnapchat = currentAccount?.type === "snapchat";
+  const isTikTok = currentAccount?.type === "tiktok";
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-8">
@@ -210,6 +212,12 @@ export default function App() {
               + Add FB/IG
             </a>
             <SnapchatOAuthButton />
+            <a
+              href="/tiktok/auth/login"
+              className="inline-flex items-center px-4 py-2 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-black transition"
+            >
+              + Add TikTok
+            </a>
           </div>
         </div>
       </div>
@@ -227,7 +235,7 @@ export default function App() {
           >
             {accounts.map((a) => (
               <option key={a.id} value={a.id}>
-                {a.name} ({a.type === "facebook_page" ? "FB Page" : a.type === "instagram" ? "Instagram" : "Snapchat"})
+                {a.name} ({a.type === "facebook_page" ? "FB Page" : a.type === "instagram" ? "Instagram" : a.type === "tiktok" ? "TikTok" : "Snapchat"})
               </option>
             ))}
           </select>
@@ -235,7 +243,7 @@ export default function App() {
       )}
 
       {/* Create Post Section (FB/IG only) */}
-      {!loading && connected && currentAccount && !isSnapchat && (
+      {!loading && connected && currentAccount && !isSnapchat && !isTikTok && (
         <div className="mb-8 bg-white p-6 border border-gray-200 rounded-lg shadow-sm">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">Create Post</h2>
           <form onSubmit={handlePost}>
@@ -307,7 +315,7 @@ export default function App() {
       {/* Insights Grid */}
       {loading && <p className="text-gray-500 text-sm">Loading insights...</p>}
 
-      {!loading && !isSnapchat && insights.length > 0 && (
+      {!loading && !isSnapchat && !isTikTok && insights.length > 0 && (
         <div className="overflow-x-auto">
           <table className="min-w-full bg-white border border-gray-200 rounded-lg overflow-hidden">
             <thead className="bg-gray-100">
@@ -382,7 +390,7 @@ export default function App() {
         </div>
       )}
 
-      {!loading && connected && !isSnapchat && insights.length === 0 && selectedAccount && (
+      {!loading && connected && !isSnapchat && !isTikTok && insights.length === 0 && selectedAccount && (
         <p className="text-gray-500 text-sm">
           No posts found for this account.
         </p>
@@ -391,6 +399,13 @@ export default function App() {
       {!connected && (
         <div className="text-center py-20 text-gray-400">
           <p className="text-lg">Connect your Meta accounts to see insights</p>
+        </div>
+      )}
+
+      {/* ─── TikTok Section ────────────────────────────────────── */}
+      {connected && currentAccount?.type === "tiktok" && (
+        <div className="mt-8">
+          <TikTokDashboard accountId={selectedAccount} />
         </div>
       )}
 
