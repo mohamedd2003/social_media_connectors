@@ -9,6 +9,7 @@ export default defineConfig({
       "/api": "http://localhost:8000",
       "/auth": "http://localhost:8000",
       "/snap": "http://localhost:8000",
+      "/tiktok": "http://localhost:8000",
       "/static": "http://localhost:8000",
     },
   },

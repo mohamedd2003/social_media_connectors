@@ -26,8 +26,10 @@ import logging
 import os
 from pathlib import Path
 
+import uuid
+
 from dotenv import load_dotenv
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 
 from database import get_db, save_account, get_account
@@ -216,6 +218,42 @@ async def tiktok_videos(
 # ═══════════════════════════════════════════════════════════════════════════════
 # Video Publishing
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/videos/upload")
+async def tiktok_upload_video(file: UploadFile = File(...)):
+    """
+    Upload a local video file and return a publicly accessible URL.
+
+    POST /tiktok/videos/upload  (multipart/form-data with 'file' field)
+
+    Saves the file to static/uploads/ and returns the public URL
+    that TikTok can download from.
+    """
+    # Validate file type
+    allowed = {".mp4", ".mov", ".avi", ".webm"}
+    ext = Path(file.filename).suffix.lower() if file.filename else ".mp4"
+    if ext not in allowed:
+        raise HTTPException(400, f"Unsupported video format '{ext}'. Allowed: {', '.join(allowed)}")
+
+    # Generate unique filename to avoid collisions
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    upload_dir = Path(__file__).resolve().parent.parent / "static" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    file_path = upload_dir / unique_name
+
+    # Stream file to disk
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    # Build public URL using the tunnel/public backend URL
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=True)
+    public_url = os.getenv("PUBLIC_BACKEND_URL", "http://localhost:8000")
+    video_url = f"{public_url}/static/uploads/{unique_name}"
+
+    logger.info("Uploaded video: %s → %s", file.filename, video_url)
+    return {"video_url": video_url, "filename": unique_name}
 
 
 @router.post("/videos/publish", response_model=TikTokPublishResponse)

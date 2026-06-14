@@ -77,6 +77,7 @@ class TikTokUserProfile(BaseModel):
     avatar_url_100: str = ""
     bio_description: str = ""
     profile_deep_link: str = ""
+    profile_web_link: str = ""
     is_verified: bool = False
     follower_count: int = 0
     following_count: int = 0
@@ -117,11 +118,15 @@ class TikTokVideoItem(BaseModel):
     """A single video from TikTok's /v2/video/list/ endpoint."""
     id: str = ""
     title: str = ""
+    video_description: str = ""
     cover_image_url: str = ""
     share_url: str = ""
     embed_link: str = ""
+    embed_html: str = ""
     duration: int = 0
     create_time: int = 0
+    height: int = 0
+    width: int = 0
     # Metrics
     view_count: int = 0
     like_count: int = 0

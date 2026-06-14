@@ -53,7 +53,7 @@ TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 TIKTOK_API_BASE = "https://open.tiktokapis.com"
 
 # Required scopes for our integration
-TIKTOK_SCOPES = "user.info.basic,video.publish,video.list"
+TIKTOK_SCOPES = "user.info.basic,user.info.profile,user.info.stats,video.list,video.upload"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -156,9 +156,15 @@ class TikTokAPIService:
     Uses httpx.AsyncClient for non-blocking HTTP.
     """
 
-    def __init__(self) -> None:
-        self._client_key = os.getenv("TIKTOK_CLIENT_KEY", "")
-        self._client_secret = os.getenv("TIKTOK_CLIENT_SECRET", "")
+    @property
+    def _client_key(self) -> str:
+        """Read client key from env at call time (not cached at import)."""
+        return os.getenv("TIKTOK_CLIENT_KEY", "")
+
+    @property
+    def _client_secret(self) -> str:
+        """Read client secret from env at call time (not cached at import)."""
+        return os.getenv("TIKTOK_CLIENT_SECRET", "")
 
     # ─── OAuth 2.0 ────────────────────────────────────────────────────────
 
@@ -280,7 +286,7 @@ class TikTokAPIService:
         }
         params = {
             "fields": "open_id,union_id,display_name,avatar_url,avatar_url_100,"
-                      "bio_description,profile_deep_link,is_verified,"
+                      "bio_description,profile_deep_link,profile_web_link,is_verified,"
                       "follower_count,following_count,likes_count,video_count",
         }
 
@@ -303,6 +309,7 @@ class TikTokAPIService:
             avatar_url_100=user_data.get("avatar_url_100", ""),
             bio_description=user_data.get("bio_description", ""),
             profile_deep_link=user_data.get("profile_deep_link", ""),
+            profile_web_link=user_data.get("profile_web_link", ""),
             is_verified=user_data.get("is_verified", False),
             follower_count=_safe_int(user_data.get("follower_count")),
             following_count=_safe_int(user_data.get("following_count")),
@@ -338,9 +345,9 @@ class TikTokAPIService:
             "Content-Type": "application/json",
         }
         params = {
-            "fields": "id,title,cover_image_url,share_url,embed_link,"
-                      "duration,create_time,view_count,like_count,"
-                      "comment_count,share_count",
+            "fields": "id,title,video_description,cover_image_url,share_url,"
+                      "embed_link,embed_html,duration,create_time,height,width,"
+                      "view_count,like_count,comment_count,share_count",
         }
         body: dict[str, Any] = {"max_count": min(max_count, 20)}
         if cursor is not None:
@@ -362,11 +369,15 @@ class TikTokAPIService:
             videos.append(TikTokVideoItem(
                 id=v.get("id", ""),
                 title=v.get("title", ""),
+                video_description=v.get("video_description", ""),
                 cover_image_url=v.get("cover_image_url", ""),
                 share_url=v.get("share_url", ""),
                 embed_link=v.get("embed_link", ""),
+                embed_html=v.get("embed_html", ""),
                 duration=_safe_int(v.get("duration")),
                 create_time=_safe_int(v.get("create_time")),
+                height=_safe_int(v.get("height")),
+                width=_safe_int(v.get("width")),
                 view_count=_safe_int(v.get("view_count")),
                 like_count=_safe_int(v.get("like_count")),
                 comment_count=_safe_int(v.get("comment_count")),
