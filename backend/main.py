@@ -18,8 +18,11 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 from routers.snapchat import router as snapchat_router
 from routers.snapchat_v1 import router as snapchat_v1_router
+from routers.snapchat_competitor import router as snapchat_competitor_router
 from routers.tiktok import router as tiktok_router
 from routers.tiktok_competitor import router as tiktok_competitor_router
+from routers.instagram_competitor import router as instagram_competitor_router
+from routers.facebook_competitor import router as facebook_competitor_router
 
 APP_ID = os.getenv("META_APP_ID")
 APP_SECRET = os.getenv("META_APP_SECRET")
@@ -64,10 +67,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # ─── Snapchat Router ─────────────────────────────────────────────────────
 app.include_router(snapchat_router)
 app.include_router(snapchat_v1_router)
+app.include_router(snapchat_competitor_router)
 
 # ─── TikTok Router ───────────────────────────────────────────────────────
 app.include_router(tiktok_router)
 app.include_router(tiktok_competitor_router)
+app.include_router(instagram_competitor_router)
+app.include_router(facebook_competitor_router)
 
 
 # ─── Step 1: OAuth Flow ─────────────────────────────────────────────────────

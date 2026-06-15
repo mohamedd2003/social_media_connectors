@@ -4,6 +4,9 @@ import SnapchatDashboard from "./components/SnapchatDashboard";
 import SnapchatShareButton from "./components/SnapchatShareButton";
 import TikTokDashboard from "./components/TikTokDashboard";
 import TikTokCompetitorAnalysis from "./components/TikTokCompetitorAnalysis";
+import InstagramCompetitorAnalysis from "./components/InstagramCompetitorAnalysis";
+import FacebookCompetitorAnalysis from "./components/FacebookCompetitorAnalysis";
+import SnapchatCompetitorAnalysis from "./components/SnapchatCompetitorAnalysis";
 
 function engagementBadge(rate) {
   if (rate === null || rate === undefined) return null;
@@ -421,6 +424,15 @@ export default function App() {
       <div className="mt-10 pt-8 border-t border-gray-200">
         <TikTokCompetitorAnalysis />
       </div>
+
+      {/* ─── Instagram Competitor Analysis ─────────────────────── */}
+      <InstagramCompetitorAnalysis />
+
+      {/* ─── Facebook Competitor Analysis ──────────────────────── */}
+      <FacebookCompetitorAnalysis />
+
+      {/* ─── Snapchat Competitor Analysis ──────────────────────── */}
+      <SnapchatCompetitorAnalysis />
 
       {/* Comments Modal */}
       {commentsModalOpen && (
