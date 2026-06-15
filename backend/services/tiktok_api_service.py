@@ -103,22 +103,42 @@ def _raise_for_status(resp: httpx.Response, context: str) -> None:
 
 def _check_tiktok_error(data: dict, context: str) -> None:
     """
-    TikTok often returns 200 with an error object in the body.
-    Check the nested error structure and raise if present.
+    TikTok often returns HTTP 200 with an error object in the body.
+
+    Two known response formats:
+      1. {"error": {"code": "ok", "message": "...", "log_id": "..."}, "data": {...}}
+      2. {"error": {"code": "invalid_param", "message": "...", "log_id": "..."}}
+
+    For the publish endpoint specifically, TikTok may also return:
+      {"error": {"code": "spam_risk_too_many_posts", ...}}
+      {"error": {"code": "access_token_invalid", ...}}
     """
     error = data.get("error", {})
     error_code = error.get("code", "ok")
-    if error_code != "ok" and error_code != 0:
-        msg = error.get("message", "Unknown TikTok error")
-        log_id = error.get("log_id", "")
-        # Map TikTok error codes to HTTP status codes
-        if "token" in msg.lower() or "auth" in msg.lower():
-            raise HTTPException(401, f"TikTok auth error ({context}): {msg} [log_id={log_id}]")
-        if "scope" in msg.lower() or "permission" in msg.lower():
-            raise HTTPException(403, f"TikTok scope error ({context}): {msg} [log_id={log_id}]")
-        if "rate" in msg.lower():
-            raise HTTPException(429, f"TikTok rate limit ({context}): {msg} [log_id={log_id}]")
-        raise HTTPException(400, f"TikTok error ({context}): {msg} [log_id={log_id}]")
+
+    # "ok" or 0 means success
+    if error_code == "ok" or error_code == 0:
+        return
+
+    msg = error.get("message", str(error_code))
+    log_id = error.get("log_id", data.get("request_id", ""))
+
+    logger.error("TikTok API error [%s]: code=%s, msg=%s, log_id=%s", context, error_code, msg, log_id)
+
+    # Map known error codes to proper HTTP status codes
+    code_lower = str(error_code).lower()
+    msg_lower = msg.lower()
+
+    if any(k in code_lower or k in msg_lower for k in ("token", "auth", "access_token_invalid", "expired")):
+        raise HTTPException(401, f"TikTok auth error ({context}): {msg} [code={error_code}, log_id={log_id}]")
+    if any(k in code_lower or k in msg_lower for k in ("scope", "permission", "forbidden")):
+        raise HTTPException(403, f"TikTok scope error ({context}): {msg} [code={error_code}, log_id={log_id}]")
+    if any(k in code_lower or k in msg_lower for k in ("rate", "spam_risk", "too_many")):
+        raise HTTPException(429, f"TikTok rate limit ({context}): {msg} [code={error_code}, log_id={log_id}]")
+    if any(k in code_lower or k in msg_lower for k in ("invalid_param", "invalid_field", "url")):
+        raise HTTPException(422, f"TikTok validation error ({context}): {msg} [code={error_code}, log_id={log_id}]")
+
+    raise HTTPException(400, f"TikTok error ({context}): {msg} [code={error_code}, log_id={log_id}]")
 
 
 def _handle_network_error(e: Exception, context: str) -> None:
@@ -394,27 +414,41 @@ class TikTokAPIService:
         access_token: str,
         title: str,
         video_url: str,
-        privacy_level: str = "PUBLIC_TO_EVERYONE",
+        privacy_level: str = "SELF_ONLY",
+        video_cover_timestamp_ms: int = 1000,
         disable_duet: bool = False,
         disable_stitch: bool = False,
         disable_comment: bool = False,
     ) -> TikTokPublishResponse:
         """
-        Publish a video to TikTok using the Direct Post (URL) method.
+        Publish a video to TikTok using the Direct Post (PULL_FROM_URL) method.
 
         POST https://open.tiktokapis.com/v2/post/publish/video/init/
-        Required scope: video.publish
+        Authorization: Bearer <access_token>
+        Content-Type: application/json; charset=utf-8
 
-        TikTok requires the video to be at a publicly accessible URL.
-        The caller must upload the file to S3/Cloud Storage first,
-        then pass that URL here.
+        Official TikTok v2 payload structure:
+        {
+            "post_info": {
+                "title": "caption #hashtags",
+                "privacy_level": "SELF_ONLY",
+                "disable_duet": false,
+                "disable_stitch": false,
+                "disable_comment": false,
+                "video_cover_timestamp_ms": 1000
+            },
+            "source_info": {
+                "source": "PULL_FROM_URL",
+                "video_url": "https://..."
+            }
+        }
 
         Args:
-            access_token: Valid TikTok access token.
+            access_token: Valid TikTok Bearer access token.
             title: Video caption (max 150 chars), may include #hashtags.
-            video_url: Public URL where TikTok can download the video.
-            privacy_level: One of PUBLIC_TO_EVERYONE, MUTUAL_FOLLOW_FRIENDS,
-                           FOLLOWER_OF_CREATOR, SELF_ONLY.
+            video_url: Publicly accessible direct URL to the video file.
+            privacy_level: SELF_ONLY | PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | FOLLOWER_OF_CREATOR.
+            video_cover_timestamp_ms: Timestamp in ms for the cover image frame.
             disable_duet: If True, prevent others from creating duets.
             disable_stitch: If True, prevent others from stitching.
             disable_comment: If True, disable comments on the video.
@@ -423,10 +457,15 @@ class TikTokAPIService:
             TikTokPublishResponse with publish_id and initial status.
         """
         url = f"{TIKTOK_API_BASE}/v2/post/publish/video/init/"
+
+        # TikTok requires Bearer token in Authorization header
+        # and Content-Type must be exactly "application/json; charset=utf-8"
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
+            "Content-Type": "application/json; charset=utf-8",
         }
+
+        # Build the exact nested payload TikTok expects
         payload = {
             "post_info": {
                 "title": title,
@@ -434,6 +473,7 @@ class TikTokAPIService:
                 "disable_duet": disable_duet,
                 "disable_stitch": disable_stitch,
                 "disable_comment": disable_comment,
+                "video_cover_timestamp_ms": video_cover_timestamp_ms,
             },
             "source_info": {
                 "source": "PULL_FROM_URL",
@@ -441,11 +481,22 @@ class TikTokAPIService:
             },
         }
 
+        logger.info(
+            "TikTok publish request: url=%s, title=%s, video_url=%s, privacy=%s",
+            url, title[:50], video_url[:80], privacy_level,
+        )
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
+                resp = await client.post(
+                    url,
+                    headers=headers,
+                    content=__import__('json').dumps(payload),  # Send raw JSON string, not httpx json= which may override Content-Type
+                )
         except Exception as e:
             _handle_network_error(e, "publish video")
+
+        logger.info("TikTok publish response: status=%d, body=%s", resp.status_code, resp.text[:500])
 
         _raise_for_status(resp, "publish video")
         data = resp.json()

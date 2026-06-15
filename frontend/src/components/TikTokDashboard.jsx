@@ -14,13 +14,14 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
 
   // Analytics data
   const [analytics, setAnalytics] = useState(null);
+  const [needsReauth, setNeedsReauth] = useState(false);
 
   // Publish form state
   const [videoUrl, setVideoUrl] = useState("");
   const [videoFile, setVideoFile] = useState(null);
   const [uploadProgress, setUploadProgress] = useState("");
   const [caption, setCaption] = useState("");
-  const [privacyLevel, setPrivacyLevel] = useState("PUBLIC_TO_EVERYONE");
+  const [privacyLevel, setPrivacyLevel] = useState("SELF_ONLY");
   const [isPublishing, setIsPublishing] = useState(false);
   const [publishStatus, setPublishStatus] = useState(null);
   const [dragActive, setDragActive] = useState(false);
@@ -32,12 +33,19 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
     if (!accountId) return;
     setLoading(true);
     setError(null);
+    setNeedsReauth(false);
     try {
       const res = await fetch(
         `${backendUrl}/tiktok/profile/analytics?account_id=${accountId}`
       );
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Failed to load TikTok analytics");
+      if (!res.ok) {
+        if (res.status === 401) {
+          setNeedsReauth(true);
+          throw new Error(data.detail || "TikTok session expired.");
+        }
+        throw new Error(data.detail || "Failed to load TikTok analytics");
+      }
       setAnalytics(data);
     } catch (err) {
       setError(err.message);
@@ -54,7 +62,10 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
 
   const handlePublish = async (e) => {
     e.preventDefault();
-    if (!caption.trim()) return;
+    if (!caption.trim()) {
+      setPublishStatus({ type: "error", message: "Please add a caption before posting." });
+      return;
+    }
     if (!videoUrl.trim() && !videoFile) return;
 
     setIsPublishing(true);
@@ -92,7 +103,17 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
         }
       );
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Failed to publish video");
+      if (!res.ok) {
+        if (res.status === 401) {
+          setPublishStatus({
+            type: "auth",
+            message: data.detail || "TikTok session expired. Please re-authenticate.",
+          });
+        } else {
+          throw new Error(data.detail || "Failed to publish video");
+        }
+        return;
+      }
 
       setPublishStatus({
         type: "success",
@@ -103,7 +124,13 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
       setCaption("");
       setUploadProgress("");
     } catch (err) {
-      setPublishStatus({ type: "error", message: err.message });
+      const isAuth = err.message?.toLowerCase().includes("re-authenticate") ||
+                     err.message?.toLowerCase().includes("expired") ||
+                     err.message?.toLowerCase().includes("token");
+      setPublishStatus({
+        type: isAuth ? "auth" : "error",
+        message: err.message,
+      });
       setUploadProgress("");
     } finally {
       setIsPublishing(false);
@@ -181,14 +208,27 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
   if (error) {
     return (
       <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center">
-        <p className="text-red-700 font-medium mb-2">Failed to load TikTok data</p>
+        <p className="text-red-700 font-medium mb-2">
+          {needsReauth ? "TikTok Session Expired" : "Failed to load TikTok data"}
+        </p>
         <p className="text-red-500 text-sm mb-4">{error}</p>
-        <button
-          onClick={fetchAnalytics}
-          className="px-4 py-2 bg-red-600 text-white text-sm rounded-lg hover:bg-red-700 transition"
-        >
-          Retry
-        </button>
+        <div className="flex items-center justify-center gap-3">
+          {needsReauth ? (
+            <a
+              href={`${backendUrl}/tiktok/auth/login`}
+              className="px-5 py-2.5 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-black transition"
+            >
+              Re-connect TikTok
+            </a>
+          ) : (
+            <button
+              onClick={fetchAnalytics}
+              className="px-4 py-2 bg-red-600 text-white text-sm rounded-lg hover:bg-red-700 transition"
+            >
+              Retry
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -483,17 +523,28 @@ export default function TikTokDashboard({ accountId, backendUrl = "" }) {
                 className={`rounded-lg p-4 text-sm ${
                   publishStatus.type === "success"
                     ? "bg-green-50 text-green-700 border border-green-200"
-                    : "bg-red-50 text-red-700 border border-red-200"
+                    : publishStatus.type === "auth"
+                      ? "bg-amber-50 text-amber-800 border border-amber-200"
+                      : "bg-red-50 text-red-700 border border-red-200"
                 }`}
               >
-                {publishStatus.message}
+                <p>{publishStatus.message}</p>
+                {publishStatus.type === "auth" && (
+                  <a
+                    href={`${backendUrl}/tiktok/auth/login`}
+                    className="mt-3 inline-flex items-center gap-2 px-4 py-2 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-black transition"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                    Re-connect TikTok
+                  </a>
+                )}
               </div>
             )}
 
             {/* Submit button */}
             <button
               type="submit"
-              disabled={isPublishing || (!videoUrl.trim() && !videoFile) || !caption.trim()}
+              disabled={isPublishing || (!videoUrl.trim() && !videoFile)}
               className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-pink-500 to-rose-500 text-white py-3 px-6 rounded-xl text-sm font-semibold hover:from-pink-600 hover:to-rose-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-pink-500/25"
             >
               {isPublishing ? (

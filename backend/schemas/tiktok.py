@@ -146,8 +146,9 @@ TikTokProfileInsightsResponse.model_rebuild()
 class TikTokPublishRequest(BaseModel):
     """Request body for the video publish endpoint."""
     title: str = Field(..., max_length=150, description="Video caption / hashtags")
-    video_url: str = Field(..., description="Publicly accessible URL of the video file")
-    privacy_level: TikTokPrivacyLevel = TikTokPrivacyLevel.PUBLIC_TO_EVERYONE
+    video_url: str = Field(..., description="Publicly accessible direct URL of the video file")
+    privacy_level: TikTokPrivacyLevel = TikTokPrivacyLevel.SELF_ONLY
+    video_cover_timestamp_ms: int = Field(default=1000, description="Cover image timestamp in ms")
     disable_duet: bool = False
     disable_stitch: bool = False
     disable_comment: bool = False

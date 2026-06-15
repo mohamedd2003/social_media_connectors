@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 
-from database import get_db, save_account, get_account
+from database import get_db, save_account, get_account, update_account_tokens
 from schemas.tiktok import (
     TikTokProfileInsightsResponse,
     TikTokPublishRequest,
@@ -109,6 +109,51 @@ def _require_tiktok_account(account_id: str) -> dict:
     if not tokens:
         raise HTTPException(404, f"TikTok account '{account_id}' not found. Connect via /tiktok/auth/login.")
     return tokens
+
+
+async def ensure_fresh_token(account_id: str) -> str:
+    """
+    Get a valid TikTok access token for the account.
+
+    Strategy:
+      1. Return the stored access_token as-is (TikTok tokens last 24h).
+      2. If an API call returns 401, the caller should invoke
+         _try_refresh_and_retry() to attempt a refresh.
+
+    This avoids breaking a perfectly valid token by refreshing unnecessarily.
+    """
+    tokens = _require_tiktok_account(account_id)
+    return tokens["access_token"]
+
+
+async def _try_refresh_and_retry(account_id: str) -> str | None:
+    """
+    Attempt to refresh the TikTok access token.
+
+    Returns the new access_token on success, or None if refresh fails.
+    Persists the rotated tokens in the database.
+    """
+    tokens = _require_tiktok_account(account_id)
+    stored_refresh = tokens.get("refresh_token", "")
+
+    if not stored_refresh:
+        return None
+
+    try:
+        token_data = await _service.refresh_tokens(stored_refresh)
+        new_access = token_data.get("access_token")
+        new_refresh = token_data.get("refresh_token", stored_refresh)
+
+        if not new_access:
+            logger.warning("TikTok refresh returned no access_token for %s", account_id)
+            return None
+
+        update_account_tokens(account_id, new_access, new_refresh)
+        logger.info("TikTok token refreshed for account %s", account_id)
+        return new_access
+    except Exception as e:
+        logger.warning("TikTok token refresh failed for %s: %s", account_id, e)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -193,7 +238,16 @@ async def tiktok_profile_analytics(account_id: str = Query(...)):
     and a list of recent videos with per-video stats.
     """
     tokens = _require_tiktok_account(account_id)
-    return await _service.fetch_profile_analytics(tokens["access_token"])
+    access_token = await ensure_fresh_token(account_id)
+    try:
+        return await _service.fetch_profile_analytics(access_token)
+    except HTTPException as e:
+        if e.status_code != 401:
+            raise
+        new_token = await _try_refresh_and_retry(account_id)
+        if not new_token:
+            raise HTTPException(401, "TikTok session expired. Please re-connect your TikTok account.")
+        return await _service.fetch_profile_analytics(new_token)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -212,7 +266,16 @@ async def tiktok_videos(
     GET /tiktok/videos?account_id=xxx&max_count=20
     """
     tokens = _require_tiktok_account(account_id)
-    return await _service.fetch_video_list(tokens["access_token"], max_count=max_count)
+    access_token = await ensure_fresh_token(account_id)
+    try:
+        return await _service.fetch_video_list(access_token, max_count=max_count)
+    except HTTPException as e:
+        if e.status_code != 401:
+            raise
+        new_token = await _try_refresh_and_retry(account_id)
+        if not new_token:
+            raise HTTPException(401, "TikTok session expired. Please re-connect your TikTok account.")
+        return await _service.fetch_video_list(new_token, max_count=max_count)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -262,24 +325,40 @@ async def tiktok_publish_video(
     body: TikTokPublishRequest = ...,
 ):
     """
-    Publish a video to TikTok using the Direct Post (URL) method.
+    Publish a video to TikTok using the Direct Post (PULL_FROM_URL) method.
 
-    POST /tiktok/videos/publish?account_id=xxx
-    Body: { "title": "...", "video_url": "https://...", "privacy_level": "PUBLIC_TO_EVERYONE" }
-
-    The video_url must be a publicly accessible URL (e.g., S3 presigned URL).
-    TikTok will download the video from this URL and process it.
+    Uses the stored access_token first. If TikTok returns 401,
+    automatically refreshes the token and retries once.
     """
-    tokens = _require_tiktok_account(account_id)
-    return await _service.publish_video(
-        access_token=tokens["access_token"],
-        title=body.title,
-        video_url=body.video_url,
-        privacy_level=body.privacy_level.value,
-        disable_duet=body.disable_duet,
-        disable_stitch=body.disable_stitch,
-        disable_comment=body.disable_comment,
-    )
+    _require_tiktok_account(account_id)
+    access_token = await ensure_fresh_token(account_id)
+
+    async def _do_publish(token: str) -> TikTokPublishResponse:
+        return await _service.publish_video(
+            access_token=token,
+            title=body.title,
+            video_url=body.video_url,
+            privacy_level=body.privacy_level.value,
+            video_cover_timestamp_ms=body.video_cover_timestamp_ms,
+            disable_duet=body.disable_duet,
+            disable_stitch=body.disable_stitch,
+            disable_comment=body.disable_comment,
+        )
+
+    try:
+        return await _do_publish(access_token)
+    except HTTPException as e:
+        if e.status_code != 401:
+            raise
+        # Token might be expired — try refreshing once
+        logger.info("Publish got 401, attempting token refresh for %s", account_id)
+        new_token = await _try_refresh_and_retry(account_id)
+        if not new_token:
+            raise HTTPException(
+                401,
+                "TikTok session expired. Please re-connect your TikTok account.",
+            )
+        return await _do_publish(new_token)
 
 
 @router.post("/videos/publish/status", response_model=TikTokPublishStatusResponse)
@@ -293,10 +372,22 @@ async def tiktok_publish_status(
     POST /tiktok/videos/publish/status?account_id=xxx&publish_id=yyy
     """
     tokens = _require_tiktok_account(account_id)
-    return await _service.check_publish_status(
-        access_token=tokens["access_token"],
-        publish_id=publish_id,
-    )
+    access_token = await ensure_fresh_token(account_id)
+    try:
+        return await _service.check_publish_status(
+            access_token=access_token,
+            publish_id=publish_id,
+        )
+    except HTTPException as e:
+        if e.status_code != 401:
+            raise
+        new_token = await _try_refresh_and_retry(account_id)
+        if not new_token:
+            raise HTTPException(401, "TikTok session expired. Please re-connect your TikTok account.")
+        return await _service.check_publish_status(
+            access_token=new_token,
+            publish_id=publish_id,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

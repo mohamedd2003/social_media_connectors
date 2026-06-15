@@ -3,6 +3,7 @@ import SnapchatOAuthButton from "./components/SnapchatOAuthButton";
 import SnapchatDashboard from "./components/SnapchatDashboard";
 import SnapchatShareButton from "./components/SnapchatShareButton";
 import TikTokDashboard from "./components/TikTokDashboard";
+import TikTokCompetitorAnalysis from "./components/TikTokCompetitorAnalysis";
 
 function engagementBadge(rate) {
   if (rate === null || rate === undefined) return null;
@@ -415,6 +416,11 @@ export default function App() {
           <SnapchatDashboard accountId={selectedAccount} />
         </div>
       )}
+
+      {/* ─── TikTok Competitor Analysis ─────────────────────────── */}
+      <div className="mt-10 pt-8 border-t border-gray-200">
+        <TikTokCompetitorAnalysis />
+      </div>
 
       {/* Comments Modal */}
       {commentsModalOpen && (
