@@ -32,6 +32,46 @@ class FacebookCompetitorService:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _extract_post_type(post: dict) -> str:
+        if not isinstance(post, dict):
+            return "Post"
+
+        if bool(post.get("isVideo")):
+            return "Video"
+
+        url = str(post.get("url") or post.get("postUrl") or post.get("permalink") or "").lower()
+        if "/reel/" in url or "/videos/" in url:
+            return "Video"
+
+        media = post.get("media")
+        if isinstance(media, list) and media:
+            first_media = media[0]
+            if isinstance(first_media, dict):
+                typename = str(first_media.get("__typename") or "").lower()
+                if "video" in typename:
+                    return "Video"
+                if "photo" in typename or "image" in typename:
+                    return "Image"
+
+        has_image = bool(
+            post.get("full_picture")
+            or post.get("fullPicture")
+            or post.get("image")
+            or post.get("imageUrl")
+            or post.get("photo")
+            or post.get("photoUrl")
+            or post.get("picture")
+        )
+        if has_image:
+            return "Image"
+
+        message = str(post.get("text") or post.get("message") or post.get("caption") or "").strip()
+        if message:
+            return "Text"
+
+        return "Post"
+
     async def _get_apify_token(self) -> str:
         load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=True)
         token = os.getenv("APIFY_API_TOKEN", "")
@@ -179,26 +219,72 @@ class FacebookCompetitorService:
             if isinstance(media, list) and media:
                 first_media = media[0]
                 if isinstance(first_media, dict):
+                    thumbnail_img = first_media.get("thumbnailImage")
+                    thumbnail_uri = thumbnail_img.get("uri", "") if isinstance(thumbnail_img, dict) else ""
+                    photo_image = first_media.get("photo_image")
+                    photo_image_uri = photo_image.get("uri", "") if isinstance(photo_image, dict) else ""
+                    full_image = first_media.get("full_image")
+                    full_image_uri = full_image.get("uri", "") if isinstance(full_image, dict) else ""
+                    original_image = first_media.get("original_image")
+                    original_image_uri = original_image.get("uri", "") if isinstance(original_image, dict) else ""
                     media_image = str(
                         first_media.get("thumbnail")
-                        or first_media.get("thumbnailImage", {}).get("uri")
+                        or thumbnail_uri
+                        or original_image_uri
+                        or full_image_uri
+                        or photo_image_uri
+                        or first_media.get("photo")
+                        or first_media.get("image")
                         or first_media.get("url")
                         or ""
                     )
+                elif isinstance(first_media, str):
+                    media_image = first_media
+
+            # Fallback: check attachments structure (Graph API style)
+            if not media_image:
+                attachments = post.get("attachments")
+                if isinstance(attachments, dict):
+                    att_data = attachments.get("data") or []
+                elif isinstance(attachments, list):
+                    att_data = attachments
+                else:
+                    att_data = []
+                for att in att_data:
+                    if not isinstance(att, dict):
+                        continue
+                    att_media = att.get("media")
+                    if isinstance(att_media, dict):
+                        img = att_media.get("image") or att_media.get("source")
+                        if isinstance(img, dict):
+                            media_image = img.get("src") or img.get("uri") or img.get("url") or ""
+                        elif isinstance(img, str):
+                            media_image = img
+                    if media_image:
+                        break
 
             parsed_posts.append(
                 LatestFacebookPost(
                     id=str(post.get("postId") or post.get("id") or ""),
                     url=str(post.get("url") or post.get("postUrl") or post.get("permalink") or ""),
                     message=str(post.get("text") or post.get("message") or post.get("caption") or ""),
-                    imageUrl=str(post.get("image") or post.get("imageUrl") or post.get("photo") or media_image),
+                    postType=self._extract_post_type(post),
+                    imageUrl=str(
+                        post.get("full_picture")
+                        or post.get("fullPicture")
+                        or post.get("image")
+                        or post.get("imageUrl")
+                        or post.get("photo")
+                        or post.get("photoUrl")
+                        or post.get("picture")
+                        or media_image
+                    ),
                     createdTime=post.get("time") or post.get("timestamp") or post.get("created_time"),
                     likeCount=self._to_int(post.get("likes") or post.get("likeCount") or 0),
                     commentCount=self._to_int(post.get("comments") or post.get("commentCount") or 0),
                     shareCount=self._to_int(post.get("shares") or post.get("shareCount") or 0),
                     reactionCount=self._to_int(
-                        post.get("topReactionsCount")
-                        or post.get("reactions")
+                        post.get("reactions")
                         or post.get("reactionCount")
                         or post.get("likes")
                         or 0
@@ -220,3 +306,16 @@ class FacebookCompetitorService:
             pageUrl=str(profile.get("pageUrl", "")),
             latestPosts=parsed_posts,
         )
+
+    async def scrape_competitor_debug(self, query: str) -> dict:
+        """Return raw Apify data for debugging field names."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            token = await self._get_apify_token()
+            page_url = await self._normalize_to_page_url(client, query)
+            posts_payload = {"startUrls": [{"url": page_url}], "resultsLimit": 3}
+
+            posts_run_id = await self._start_run(client, POSTS_ACTOR_ID, posts_payload, token)
+            posts_dataset_id = await self._wait_for_run(client, posts_run_id, token)
+            posts_items = await self._fetch_dataset_items(client, posts_dataset_id, token)
+
+        return {"raw_posts": posts_items}

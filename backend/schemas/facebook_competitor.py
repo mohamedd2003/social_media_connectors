@@ -11,6 +11,7 @@ class LatestFacebookPost(BaseModel):
     id: str = Field("", description="Facebook post ID")
     url: str = Field("", description="Facebook post permalink")
     message: str = Field("", description="Post text/content")
+    postType: str = Field("Post", description="Post type (Video, Image, Text, etc.)")
     imageUrl: str = Field("", description="Post image URL")
     createdTime: str | None = Field(None, description="Post timestamp")
     likeCount: int = Field(0, description="Post likes")

@@ -1,5 +1,7 @@
 import os
 import glob
+import sys
+import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
@@ -23,6 +25,7 @@ from routers.tiktok import router as tiktok_router
 from routers.tiktok_competitor import router as tiktok_competitor_router
 from routers.instagram_competitor import router as instagram_competitor_router
 from routers.facebook_competitor import router as facebook_competitor_router
+from routers.manual_scrape import router as manual_scrape_router
 
 APP_ID = os.getenv("META_APP_ID")
 APP_SECRET = os.getenv("META_APP_SECRET")
@@ -30,6 +33,10 @@ PUBLIC_BACKEND_URL = os.getenv("PUBLIC_BACKEND_URL", "http://localhost:8000")
 REDIRECT_URI = os.getenv("REDIRECT_URI", f"{PUBLIC_BACKEND_URL}/auth/callback")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 GRAPH_API = "https://graph.facebook.com/v22.0"
+
+# Playwright needs subprocess support; on Windows force Proactor policy.
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 @asynccontextmanager
@@ -74,6 +81,9 @@ app.include_router(tiktok_router)
 app.include_router(tiktok_competitor_router)
 app.include_router(instagram_competitor_router)
 app.include_router(facebook_competitor_router)
+
+# ─── Manual Scrape Router ────────────────────────────────────────────────
+app.include_router(manual_scrape_router)
 
 
 # ─── Step 1: OAuth Flow ─────────────────────────────────────────────────────

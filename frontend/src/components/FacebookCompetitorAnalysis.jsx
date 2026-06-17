@@ -193,6 +193,31 @@ export default function FacebookCompetitorAnalysis({ backendUrl = "" }) {
                   )}
 
                   <div className="p-4">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        {data.profilePicture ? (
+                          <img
+                            src={data.profilePicture}
+                            alt={data.name || "Facebook page"}
+                            className="h-8 w-8 rounded-full object-cover border border-gray-200"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <div className="h-8 w-8 rounded-full bg-gray-200" />
+                        )}
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-semibold text-gray-800">
+                            {data.name || data.pageId || "Facebook Page"}
+                          </p>
+                          {data.username && (
+                            <p className="truncate text-[11px] text-gray-500">@{data.username}</p>
+                          )}
+                        </div>
+                      </div>
+                      <span className="inline-flex shrink-0 items-center rounded-full bg-blue-50 text-blue-700 border border-blue-200 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide">
+                        {post.postType || "Post"}
+                      </span>
+                    </div>
                     <p className="text-sm text-gray-800 line-clamp-3 min-h-[3.6em]">
                       {post.message || "(no text)"}
                     </p>

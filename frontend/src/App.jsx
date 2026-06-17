@@ -222,6 +222,12 @@ export default function App() {
             >
               + Add TikTok
             </a>
+            <a
+              href="/scraps"
+              className="inline-flex items-center px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 transition"
+            >
+              🔍 Manual Scraper
+            </a>
           </div>
         </div>
       </div>
