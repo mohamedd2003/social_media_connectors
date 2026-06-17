@@ -44,6 +44,11 @@ function formatDuration(seconds) {
    TikTok Results – Identical to TikTokCompetitorAnalysis.jsx
    ══════════════════════════════════════════════════════════════════ */
 function TikTokResults({ data }) {
+  const noVideosMessage =
+    data.status === "partial_success" || (data.posts_count > 0 && (!data.recent_posts || data.recent_posts.length === 0))
+      ? (data.error_message || "Profile loaded, but videos could not be extracted due to TikTok protection or layout changes.")
+      : "No videos found for this account.";
+
   return (
     <div className="space-y-6">
       {/* Profile Card */}
@@ -173,7 +178,7 @@ function TikTokResults({ data }) {
       )}
 
       {(!data.recent_posts || data.recent_posts.length === 0) && (
-        <p className="text-sm text-gray-500">No videos found for this account.</p>
+        <p className="text-sm text-gray-500">{noVideosMessage}</p>
       )}
     </div>
   );
@@ -580,6 +585,9 @@ export default function ManualScraper() {
         setError("Profile not found. Double-check the username and try again.");
       } else if (json.status === "error") {
         setError(json.error_message || "An unknown error occurred.");
+      } else if (json.status === "partial_success") {
+        setData(json);
+        setError(`⚠️ ${json.error_message || "Profile loaded, but videos could not be extracted right now. Please try again."}`);
       } else {
         setData(json);
       }

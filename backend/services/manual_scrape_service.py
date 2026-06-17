@@ -198,43 +198,88 @@ async def _scrape_tiktok(username: str) -> ScrapeResult:
     2. Playwright with response interception + DOM fallback
     3. Meta tags / og:description (last resort)
     """
-    # Strategy 1: Direct HTTP – parse __UNIVERSAL_DATA / SIGI_STATE from HTML
-    result = await _tt_strategy_http(username)
-    if result and result.status == "success" and result.recent_posts:
-        # Only skip Playwright if we actually got videos
+
+    def _final_ownership_guard(result: ScrapeResult) -> ScrapeResult:
+        """Final safety net: strip any posts that don't belong to the target user."""
+        if result and result.recent_posts:
+            filtered = _tt_filter_owned_posts(result.recent_posts, username)
+            if len(filtered) < len(result.recent_posts):
+                logger.warning(
+                    "TikTok: Final guard stripped %d/%d posts not belonging to @%s",
+                    len(result.recent_posts) - len(filtered), len(result.recent_posts), username,
+                )
+            result.recent_posts = filtered or None
+            # If we had posts but all were stripped, downgrade status
+            if not result.recent_posts and result.status == "success":
+                result.status = "partial_success"
+                result.error_message = (
+                    result.error_message or
+                    "Profile loaded, but all captured videos belonged to other creators."
+                )
         return result
+
+    # Strategy 1: Direct HTTP – parse __UNIVERSAL_DATA / SIGI_STATE from HTML
+    http_result = await _tt_strategy_http(username)
+    if http_result and http_result.status == "success" and http_result.recent_posts:
+        # Only skip Playwright if we actually got videos
+        return _final_ownership_guard(http_result)
 
     # Strategy 2: Playwright browser with scrolling + API interception
     # This is the primary strategy for getting videos (TikTok lazy-loads them)
     pw_result = await _tt_strategy_playwright(username)
     if pw_result and pw_result.status == "success" and pw_result.recent_posts:
-        return pw_result
-
-    # If Playwright got profile but no posts, merge with HTTP result
-    if pw_result and pw_result.status == "success" and result and result.status == "success":
-        # Prefer whichever has more data
-        if result.followers and not pw_result.followers:
-            pw_result.followers = result.followers
-            pw_result.following = result.following
-            pw_result.likes = result.likes
-            pw_result.display_name = result.display_name or pw_result.display_name
-            pw_result.avatar = result.avatar or pw_result.avatar
-            pw_result.bio = result.bio or pw_result.bio
-            pw_result.is_verified = result.is_verified or pw_result.is_verified
-        return pw_result
-
-    # Return HTTP result if it has profile data (even without posts)
-    if result and result.status == "success" and result.followers is not None:
-        return result
+        return _final_ownership_guard(pw_result)
 
     # Strategy 3: Meta tags (minimal data)
     meta_result = await _tt_strategy_meta(username)
-    if meta_result and meta_result.status == "success" and meta_result.followers is not None:
-        return meta_result
+
+    # Prefer whichever strategy actually returned videos.
+    for candidate in (pw_result, http_result, meta_result):
+        if candidate and candidate.status == "success" and candidate.recent_posts:
+            return _final_ownership_guard(candidate)
+
+    # Merge profile data after all video strategies are exhausted.
+    profile_result = None
+    if pw_result and pw_result.status in ("success", "partial_success"):
+        profile_result = pw_result
+
+    if profile_result and http_result and http_result.status in ("success", "partial_success"):
+        if http_result.followers and not profile_result.followers:
+            profile_result.followers = http_result.followers
+        if http_result.following and not profile_result.following:
+            profile_result.following = http_result.following
+        if http_result.likes and not profile_result.likes:
+            profile_result.likes = http_result.likes
+        if http_result.posts_count and not profile_result.posts_count:
+            profile_result.posts_count = http_result.posts_count
+        profile_result.display_name = profile_result.display_name or http_result.display_name
+        profile_result.avatar = profile_result.avatar or http_result.avatar
+        profile_result.bio = profile_result.bio or http_result.bio
+        profile_result.is_verified = profile_result.is_verified or http_result.is_verified
+        profile_result.region = profile_result.region or http_result.region
+        profile_result.language = profile_result.language or http_result.language
+
+    if not profile_result and http_result and http_result.status in ("success", "partial_success"):
+        profile_result = http_result
+
+    if not profile_result and meta_result and meta_result.status in ("success", "partial_success"):
+        profile_result = meta_result
+
+    if profile_result:
+        if profile_result.recent_posts:
+            profile_result.status = "success"
+            return _final_ownership_guard(profile_result)
+        if (profile_result.posts_count or 0) > 0:
+            profile_result.status = "partial_success"
+            if not profile_result.error_message:
+                profile_result.error_message = (
+                    "Profile loaded, but TikTok videos could not be extracted due to anti-bot checks or layout changes."
+                )
+        return profile_result
 
     # Return whatever we got
-    if result:
-        return result
+    if http_result:
+        return http_result
     if pw_result:
         return pw_result
     if meta_result:
@@ -317,20 +362,86 @@ def _extract_tt_universal_data(html: str, username: str) -> ScrapeResult | None:
 
         data = _json.loads(json_str)
 
-        # Navigate to user data – structure: __DEFAULT_SCOPE__."webapp.user-detail"
+        # Navigate to user data – structure is frequently changed by TikTok.
         default_scope = data.get("__DEFAULT_SCOPE__", {})
         user_detail = default_scope.get("webapp.user-detail", {})
         user_info = user_detail.get("userInfo", {})
 
         if not user_info:
+            for scope_value in default_scope.values():
+                if isinstance(scope_value, dict) and isinstance(scope_value.get("userInfo"), dict):
+                    user_detail = scope_value
+                    user_info = scope_value.get("userInfo", {})
+                    break
+
+        if not user_info:
             return None
 
-        # itemList (videos) lives at user_detail level, not inside userInfo
+        # itemList (videos) can live under multiple scope keys.
         item_list = user_detail.get("itemList", [])
+        if not item_list:
+            for scope_value in default_scope.values():
+                if isinstance(scope_value, dict):
+                    candidate = scope_value.get("itemList")
+                    if isinstance(candidate, list) and candidate:
+                        item_list = candidate
+                        break
+
+        # Filter itemList to only include videos from target user
+        if item_list:
+            item_list = [
+                item for item in item_list
+                if isinstance(item, dict) and _tt_video_belongs_to_user(item, username)
+            ]
+
         if not user_info.get("itemList") and item_list:
             user_info["itemList"] = item_list
 
-        return _parse_tt_user_info(username, user_info)
+        result = _parse_tt_user_info(username, user_info)
+
+        # Apply URL-based ownership filter on parsed posts
+        if result.recent_posts:
+            result.recent_posts = _tt_filter_owned_posts(result.recent_posts, username)
+
+        if result.recent_posts:
+            return result
+
+        # Secondary check: parse ItemModule-like structures from scope keys.
+        scope_posts: list[PostItem] = []
+        for scope_value in default_scope.values():
+            if not isinstance(scope_value, dict):
+                continue
+
+            module_candidates: list[dict] = []
+            for key in ("ItemModule", "itemModule", "item_module", "items"):
+                module = scope_value.get(key)
+                if isinstance(module, dict) and module:
+                    module_candidates.append(module)
+
+            if not module_candidates and scope_value and all(isinstance(v, dict) for v in scope_value.values()):
+                if any(("video" in v or "stats" in v) for v in scope_value.values()):
+                    module_candidates.append(scope_value)
+
+            for module in module_candidates:
+                scope_posts.extend(_parse_tt_items(module, owner_username=username))
+
+        # Filter by URL ownership as final guard
+        scope_posts = _tt_filter_owned_posts(scope_posts, username)
+
+        if scope_posts:
+            unique_posts: list[PostItem] = []
+            seen: set[str] = set()
+            for post in scope_posts:
+                key = post.id or post.url
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                unique_posts.append(post)
+                if len(unique_posts) >= 12:
+                    break
+            result.recent_posts = unique_posts
+
+        return result
 
     except Exception:
         return None
@@ -374,9 +485,9 @@ def _extract_tt_sigi_state(html: str, username: str) -> ScrapeResult | None:
         if not user:
             return None
 
-        # Build video list from ItemModule
+        # Build video list from ItemModule – filter by owner
         item_module = data.get("ItemModule", {})
-        posts = _parse_tt_items(item_module)
+        posts = _parse_tt_items(item_module, owner_username=username)
 
         return ScrapeResult(
             status="success",
@@ -499,10 +610,60 @@ def _parse_tt_user_info(username: str, user_info: dict) -> ScrapeResult:
     )
 
 
-def _parse_tt_items(item_module: dict) -> list[PostItem]:
-    """Parse TikTok ItemModule dict into PostItem list."""
+def _tt_video_belongs_to_user(item: dict, target_username: str) -> bool:
+    """Check if a TikTok video item belongs to the target user (strict ownership)."""
+    if not target_username:
+        return True  # No filter if username unknown
+    target_lower = target_username.lower().strip()
+    author = item.get("author")
+    if isinstance(author, dict):
+        author_id = (author.get("uniqueId") or author.get("nickname") or "").lower()
+    elif isinstance(author, str):
+        author_id = author.lower()
+    else:
+        author_id = ""
+    if author_id and author_id == target_lower:
+        return True
+    # Also check authorId field (numeric or string user ID match not possible without secUid)
+    # and check nickname fallback
+    nickname = ""
+    if isinstance(author, dict):
+        nickname = (author.get("uniqueId") or "").lower()
+    # If author field is completely absent, we can't verify – allow it (DOM-extracted)
+    if not author_id and not nickname:
+        return True
+    return False
+
+
+def _tt_filter_owned_posts(posts: list["PostItem"], target_username: str) -> list["PostItem"]:
+    """Remove posts that clearly don't belong to target_username based on URL."""
+    if not target_username or not posts:
+        return posts
+    target_lower = target_username.lower().strip()
+    filtered = []
+    for post in posts:
+        # If URL contains a different @username, discard
+        if post.url:
+            url_match = re.search(r"tiktok\.com/@([\w.]+)/", post.url)
+            if url_match:
+                url_author = url_match.group(1).lower()
+                if url_author != target_lower:
+                    continue
+        filtered.append(post)
+    return filtered
+
+
+def _parse_tt_items(item_module: dict, owner_username: str | None = None) -> list[PostItem]:
+    """Parse TikTok ItemModule dict into PostItem list, optionally filtering by owner."""
     posts: list[PostItem] = []
-    for vid_id, item in list(item_module.items())[:12]:
+    for vid_id, item in list(item_module.items())[:24]:
+        if not isinstance(item, dict):
+            continue
+
+        # Strict ownership check: skip videos from other authors
+        if owner_username and not _tt_video_belongs_to_user(item, owner_username):
+            continue
+
         video = item.get("video", {})
         stats = item.get("stats", {})
         music = item.get("music", {})
@@ -536,6 +697,8 @@ def _parse_tt_items(item_module: dict) -> list[PostItem]:
             music_author=music.get("authorName") or None,
             created_at=created_at,
         ))
+        if len(posts) >= 12:
+            break
     return posts
 
 
@@ -662,6 +825,26 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
                     error_message="TikTok is showing a captcha. Try again later.",
                 )
 
+            # ── Redirect / challenge detection ──
+            # If TikTok redirected away from the profile URL to explore, login, or generic feed,
+            # the page content is NOT from the target user — abort immediately.
+            current_url = page.url.lower()
+            expected_path = f"/@{username.lower()}"
+            if expected_path not in current_url:
+                # Redirected to explore, login wall, or other non-profile page
+                redirected_to_generic = any(tok in current_url for tok in [
+                    "/explore", "/login", "/foryou", "/for-you", "loginModal",
+                ])
+                if redirected_to_generic or f"/@" not in current_url:
+                    logger.warning(
+                        "TikTok: Page redirected from @%s to %s – aborting Playwright strategy.",
+                        username, page.url,
+                    )
+                    return ScrapeResult(
+                        status="blocked_by_challenge", platform="tiktok", username=username,
+                        error_message="TikTok redirected to a login/challenge page instead of the profile.",
+                    )
+
             # Try to extract embedded JSON from page (profile + items)
             embedded = await page.evaluate("""
                 () => {
@@ -754,9 +937,14 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
 
             # ── Extract videos from intercepted API responses ──
             if captured_items:
-                logger.info("TikTok: Captured %d items from API interception", len(captured_items))
+                # Filter out items that don't belong to target user
+                owned_items = [item for item in captured_items if _tt_video_belongs_to_user(item, username)]
+                logger.info(
+                    "TikTok: Captured %d items from API interception, %d belong to @%s",
+                    len(captured_items), len(owned_items), username,
+                )
                 posts = []
-                for item in captured_items[:12]:
+                for item in owned_items[:12]:
                     video = item.get("video", {})
                     stats = item.get("stats", {})
                     music = item.get("music", {})
@@ -818,7 +1006,17 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
 
             # ── DOM fallback: extract video cards using resilient selectors ──
             # Use structural selectors that survive class name obfuscation
-            video_links = await page.query_selector_all('a[href*="/video/"]')
+            # Only extract links that belong to the target user's profile
+            all_video_links = await page.query_selector_all('a[href*="/video/"]')
+            video_links = []
+            for link in all_video_links:
+                href = await link.get_attribute("href") or ""
+                # Only keep links that contain /@username/video/
+                if f"/@{username.lower()}/video/" in href.lower() or f"/@{username}/video/" in href:
+                    video_links.append(link)
+                elif "/video/" in href and "@" not in href:
+                    # Relative link without username - may still be user's; keep with caution
+                    video_links.append(link)
             posts: list[PostItem] = []
 
             for link in video_links[:12]:
@@ -922,11 +1120,25 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
             if profile_result:
                 if posts:
                     profile_result.recent_posts = posts
-                return profile_result
+                    profile_result.status = "success"
+                    return profile_result
+                if (profile_result.posts_count or 0) == 0:
+                    profile_result.status = "success"
+                    return profile_result
 
             if captured_user_info:
                 result = _parse_tt_user_info(username, captured_user_info)
-                result.recent_posts = posts
+                if posts:
+                    result.recent_posts = posts
+                    result.status = "success"
+                    return result
+                if (result.posts_count or 0) == 0:
+                    result.status = "success"
+                    return result
+                result.status = "partial_success"
+                result.error_message = (
+                    "Profile loaded, but TikTok videos could not be extracted due to anti-bot checks or layout changes."
+                )
                 return result
 
             # Pure DOM extraction
@@ -955,8 +1167,9 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
             )
 
             if _parse_count(followers_text) is not None or posts:
+                has_posts = bool(posts)
                 return ScrapeResult(
-                    status="success",
+                    status="success" if has_posts else "partial_success",
                     platform="tiktok",
                     username=username,
                     display_name=display_name or username,
@@ -966,6 +1179,11 @@ async def _tt_strategy_playwright(username: str) -> ScrapeResult | None:
                     likes=_parse_count(likes_text),
                     bio=bio,
                     recent_posts=posts,
+                    error_message=(
+                        None
+                        if has_posts
+                        else "Profile loaded, but TikTok videos could not be extracted due to anti-bot checks or layout changes."
+                    ),
                 )
 
             return None
